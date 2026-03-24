@@ -4,7 +4,7 @@ import time
 import json
 
 JINA_BASE = "https://r.jina.ai/"
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 
 
 def extract_urls(raw: str) -> list[str]:
