@@ -144,8 +144,8 @@ Rules:
 
 Return a JSON object with exactly these keys:
 - status: one of CONFIRMED, PARTIAL, INCORRECT, NOT_FOUND
-- verdict: string, max 100 characters
-- excerpt: string, most relevant source excerpt max 150 characters, or empty string"""
+- verdict: string, max 400 characters
+- excerpt: string, most relevant source excerpt max 400 characters, or empty string"""
 
     raw_text, error = call_gemini(prompt, api_key)
 
