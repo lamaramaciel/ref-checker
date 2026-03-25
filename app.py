@@ -28,11 +28,10 @@ with st.sidebar:
     st.markdown("- 10 requests / minute")
     st.markdown("- 250 requests / day")
 
-# --- Session state ---
-if "results_df" not in st.session_state:
-    st.session_state.results_df = None
-if "last_file" not in st.session_state:
-    st.session_state.last_file = None
+# --- Session state init ---
+for key in ["results", "running", "last_file", "queue", "total"]:
+    if key not in st.session_state:
+        st.session_state[key] = None if key in ["last_file"] else ([] if key in ["results", "queue"] else False if key == "running" else 0)
 
 # --- Upload ---
 uploaded = st.file_uploader("📂 Upload spreadsheet (.csv)", type=["csv"])
@@ -45,8 +44,12 @@ if not api_key:
     st.warning("Please enter your Gemini API Key in the sidebar.")
     st.stop()
 
+# Reset if new file
 if st.session_state.last_file != uploaded.name:
-    st.session_state.results_df = None
+    st.session_state.results = []
+    st.session_state.queue = []
+    st.session_state.running = False
+    st.session_state.total = 0
     st.session_state.last_file = uploaded.name
 
 try:
@@ -83,7 +86,6 @@ st.divider()
 
 # --- Row selection ---
 st.subheader("Select rows to verify")
-
 run_all = st.checkbox("✅ Run all rows", value=False)
 
 if run_all:
@@ -91,7 +93,7 @@ if run_all:
     total_checks = len(df) * len(ref_pairs)
     st.info(f"All **{len(df)} rows** · {len(ref_pairs)} columns = **{total_checks} checks**")
     if total_checks > 250:
-        st.warning(f"⚠️ {total_checks} checks exceeds the free tier daily limit of 250. Consider running in batches.")
+        st.warning(f"⚠️ {total_checks} checks exceeds the free tier daily limit of 250.")
 else:
     col1, col2 = st.columns(2)
     with col1:
@@ -107,69 +109,123 @@ with st.expander("👁️ Preview selected rows"):
 
 st.divider()
 
-# --- Run ---
-if st.button("🚀 Run Verification", type="primary", use_container_width=True):
-    results = []
-    total = len(selected_df) * len(ref_pairs)
-    progress = st.progress(0, text="Starting verification...")
-    status_box = st.empty()
-    count = 0
-
+# --- Build queue of pending checks ---
+def build_queue(selected_df, ref_pairs):
+    queue = []
     for row_idx, row in selected_df.iterrows():
         org_name = str(row.get("Name", row_idx + 1))
-
         for data_col, ref_col in ref_pairs:
-            count += 1
-            declared_value = str(row.get(data_col, "")).strip()
-            references_raw = str(row.get(ref_col, "")).strip()
-            declared_clean = re.sub(r'\s*\[Ref\d*\]', '', declared_value).strip()
-
-            progress.progress(count / total, text=f"Checking {count}/{total}: **{org_name}** · `{data_col}`")
-            status_box.info(f"🔎 `{org_name}` — `{data_col}`: `{declared_clean[:80]}`")
-
-            if not declared_clean or declared_clean in ("nan", "N/A", "/", ""):
-                results.append({
-                    "Organization": org_name, "Column": data_col,
-                    "Declared Value": declared_clean, "Reference": references_raw,
-                    "Status": "⏭️ Skipped", "Verdict": "Empty value or N/A", "Source Excerpt": ""
-                })
-                continue
-
-            if not references_raw or references_raw in ("nan", "N/A", "/", ""):
-                results.append({
-                    "Organization": org_name, "Column": data_col,
-                    "Declared Value": declared_clean, "Reference": "",
-                    "Status": "❓ No Reference", "Verdict": "No reference provided", "Source Excerpt": ""
-                })
-                continue
-
-            result = verify_cell(
-                declared_value=declared_clean,
-                column_name=data_col,
-                references_raw=references_raw,
-                gemini_api_key=api_key
-            )
-
-            results.append({
-                "Organization": org_name, "Column": data_col,
-                "Declared Value": declared_clean, "Reference": references_raw,
-                "Status": result["status"], "Verdict": result["verdict"],
-                "Source Excerpt": result["excerpt"]
+            queue.append({
+                "org": org_name,
+                "data_col": data_col,
+                "ref_col": ref_col,
+                "row": row
             })
+    return queue
 
-            time.sleep(0.3)
+# --- Buttons ---
+col_btn1, col_btn2 = st.columns(2)
 
-    progress.progress(1.0, text="✅ Verification complete!")
-    status_box.empty()
-    st.session_state.results_df = pd.DataFrame(results)
+with col_btn1:
+    start_btn = st.button("🚀 Run Verification", type="primary", use_container_width=True)
+
+with col_btn2:
+    reset_btn = st.button("🔄 Reset Results", use_container_width=True)
+
+if reset_btn:
+    st.session_state.results = []
+    st.session_state.queue = []
+    st.session_state.running = False
+    st.session_state.total = 0
+    st.rerun()
+
+if start_btn:
+    # Build full queue, skip already done
+    full_queue = build_queue(selected_df, ref_pairs)
+    done_keys = {(r["Organization"], r["Column"]) for r in st.session_state.results}
+    pending = [item for item in full_queue if (item["org"], item["data_col"]) not in done_keys]
+    st.session_state.queue = pending
+    st.session_state.total = len(full_queue)
+    st.session_state.running = True
+
+# --- Process queue (one rerun at a time keeps connection alive) ---
+if st.session_state.running and st.session_state.queue:
+    done = len(st.session_state.results)
+    total = st.session_state.total
+    remaining = len(st.session_state.queue)
+
+    progress_val = done / total if total > 0 else 0
+    st.progress(progress_val, text=f"Checking {done}/{total} — {remaining} remaining. **Keep this tab open!**")
+
+    # Process next item
+    item = st.session_state.queue[0]
+    row = item["row"]
+    org_name = item["org"]
+    data_col = item["data_col"]
+    ref_col = item["ref_col"]
+
+    st.info(f"🔎 `{org_name}` — `{data_col}`")
+
+    declared_value = str(row.get(data_col, "")).strip()
+    references_raw = str(row.get(ref_col, "")).strip()
+    declared_clean = re.sub(r'\s*\[Ref\d*\]', '', declared_value).strip()
+
+    if not declared_clean or declared_clean in ("nan", "N/A", "/", ""):
+        result_row = {
+            "Organization": org_name, "Column": data_col,
+            "Declared Value": declared_clean, "Reference": references_raw,
+            "Status": "⏭️ Skipped", "Verdict": "Empty value or N/A", "Source Excerpt": ""
+        }
+    elif not references_raw or references_raw in ("nan", "N/A", "/", ""):
+        result_row = {
+            "Organization": org_name, "Column": data_col,
+            "Declared Value": declared_clean, "Reference": "",
+            "Status": "❓ No Reference", "Verdict": "No reference provided", "Source Excerpt": ""
+        }
+    else:
+        result = verify_cell(
+            declared_value=declared_clean,
+            column_name=data_col,
+            references_raw=references_raw,
+            gemini_api_key=api_key
+        )
+        result_row = {
+            "Organization": org_name, "Column": data_col,
+            "Declared Value": declared_clean, "Reference": references_raw,
+            "Status": result["status"], "Verdict": result["verdict"],
+            "Source Excerpt": result["excerpt"]
+        }
+
+    # Save result and remove from queue
+    st.session_state.results.append(result_row)
+    st.session_state.queue.pop(0)
+
+    time.sleep(0.3)
+
+    # Continue or finish
+    if st.session_state.queue:
+        st.rerun()
+    else:
+        st.session_state.running = False
+        st.rerun()
+
+elif st.session_state.running and not st.session_state.queue:
+    st.session_state.running = False
+
+# --- Show progress bar when idle but partial ---
+if not st.session_state.running and st.session_state.results and st.session_state.total > 0:
+    done = len(st.session_state.results)
+    total = st.session_state.total
+    if done < total:
+        st.warning(f"⚠️ Interrupted at {done}/{total}. Click **Run Verification** to continue from where you left off.")
+        st.progress(done / total)
 
 # --- Results ---
-if st.session_state.results_df is not None:
-    results_df = st.session_state.results_df
+if st.session_state.results:
+    results_df = pd.DataFrame(st.session_state.results)
     st.divider()
     st.subheader("📊 Results")
 
-    # Metrics
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Total", len(results_df))
     m2.metric("✅ Confirmed", len(results_df[results_df["Status"] == "✅ Confirmed"]))
@@ -177,7 +233,6 @@ if st.session_state.results_df is not None:
     m4.metric("⚠️ Partial", len(results_df[results_df["Status"] == "⚠️ Partial"]))
     m5.metric("🔒 Issues", len(results_df[results_df["Status"].isin(["🔒 Inaccessible", "❓ Not Found", "❓ No Reference"])]))
 
-    # Filter
     filter_status = st.multiselect(
         "Filter by status",
         options=results_df["Status"].unique().tolist(),
@@ -187,23 +242,16 @@ if st.session_state.results_df is not None:
 
     st.divider()
 
-    # --- Row-by-row detail view ---
+    # Row detail view
+    color_map = {
+        "✅ Confirmed": "🟢", "❌ Incorrect": "🔴", "⚠️ Partial": "🟡",
+        "❓ Not Found": "⚪", "🔒 Inaccessible": "🔵",
+        "⏭️ Skipped": "⚫", "❓ No Reference": "⚪",
+    }
+
     for i, row in filtered.iterrows():
-        status = row["Status"]
-
-        # Color per status
-        color_map = {
-            "✅ Confirmed": "🟢",
-            "❌ Incorrect": "🔴",
-            "⚠️ Partial": "🟡",
-            "❓ Not Found": "⚪",
-            "🔒 Inaccessible": "🔵",
-            "⏭️ Skipped": "⚫",
-            "❓ No Reference": "⚪",
-        }
-        icon = color_map.get(status, "⚪")
-
-        label = f"{icon} **{row['Organization']}** · `{row['Column']}` · {status}"
+        icon = color_map.get(row["Status"], "⚪")
+        label = f"{icon} **{row['Organization']}** · `{row['Column']}` · {row['Status']}"
 
         with st.expander(label, expanded=False):
             c1, c2 = st.columns(2)
@@ -211,7 +259,6 @@ if st.session_state.results_df is not None:
                 st.markdown("**Declared Value**")
                 st.text_area("", value=row["Declared Value"], height=120, disabled=True, key=f"dv_{i}")
                 st.markdown("**Reference URL(s)**")
-                # Show each URL as clickable link
                 urls = row["Reference"].split("|")
                 for url in urls:
                     url = url.strip()
@@ -221,15 +268,13 @@ if st.session_state.results_df is not None:
                         st.text(url)
             with c2:
                 st.markdown("**Status**")
-                st.markdown(f"### {status}")
+                st.markdown(f"### {row['Status']}")
                 st.markdown("**Verdict**")
                 st.info(row["Verdict"] if row["Verdict"] else "—")
                 st.markdown("**Source Excerpt**")
                 st.success(row["Source Excerpt"] if row["Source Excerpt"] else "No excerpt available")
 
     st.divider()
-
-    # Download
     csv_out = results_df.to_csv(index=False).encode("utf-8")
     st.download_button(
         label="⬇️ Download full report (.csv)",
