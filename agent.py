@@ -50,7 +50,7 @@ def fetch_page_text(url: str, timeout: int = 20) -> tuple[str, str]:
                 return "", "Page too short — likely blocked or empty"
             if any(phrase in text.lower() for phrase in ["sign in", "log in", "login", "401 unauthorized", "access denied"]):
                 return "", "Page requires authentication — cannot access content"
-            return text[:6000], ""
+            return text[:12000], ""
         else:
             return "", f"HTTP {resp.status_code}"
 
@@ -71,7 +71,7 @@ def call_gemini(prompt: str, api_key: str, retries: int = 2) -> tuple[str, str]:
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.0,
-            "maxOutputTokens": 2048,
+            "maxOutputTokens": 4096,
             "responseMimeType": "application/json"
         }
     }
